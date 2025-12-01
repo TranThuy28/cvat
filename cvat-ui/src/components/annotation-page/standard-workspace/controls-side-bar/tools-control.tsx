@@ -156,6 +156,13 @@ interface State {
     mode: 'detection' | 'interaction' | 'tracking';
     portals: React.ReactPortal[];
     maskThreshold: number | null;
+    logitLoading: boolean;
+}
+
+interface LogitCacheEntry {
+    map: number[][];
+    width: number;
+    height: number;
 }
 
 type DetectorResults = Extract<Awaited<ReturnType<typeof core.lambda.call>>, { version: number }>;
@@ -239,10 +246,15 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
         } | null;
         hideMessage: (() => void) | null;
     };
-
     private maskPreviewUpdateInProgress = false;
-
     private pendingMaskPreview: number | null = null;
+    private logitCache = new Map<number, LogitCacheEntry>();
+    private logitLoadSeq = 0;
+    private logitAbortController: AbortController | null = null;
+    private isComponentUnmounted = false;
+    private sliderDebounceTimer: number | null = null;
+    private lastRenderedThreshold: number | null = null;
+    private rleCache = new Map<number, number[]>(); // Cache RLE by threshold (rounded to 2 decimals)
 
     public constructor(props: Props) {
         super(props);
@@ -262,6 +274,7 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
             mode: 'interaction',
             portals: [],
             maskThreshold: null,
+            logitLoading: false,
         };
 
         this.interaction = {
@@ -297,6 +310,7 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
     public componentDidUpdate(prevProps: Props, prevState: State): void {
         const {
             isActivated, defaultApproxPolyAccuracy, canvasInstance, states, toolsBlockerState,
+            frame, jobInstance,
         } = this.props;
         const {
             approxPolyAccuracy,
@@ -306,6 +320,10 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
             maskThreshold,
         } = this.state;
 
+        if (prevProps.jobInstance !== jobInstance) {
+            this.logitCache.clear();
+        }
+
         if (prevProps.states !== states || prevState.activeTracker !== activeTracker) {
             this.setState({
                 portals: this.collectTrackerPortals(),
@@ -314,6 +332,7 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
 
         if (prevProps.isActivated && !isActivated) {
             window.removeEventListener('contextmenu', this.contextmenuDisabler);
+            this.logitAbortController?.abort();
             // hide interaction message if exists
             if (this.interaction.hideMessage) {
                 this.interaction.hideMessage();
@@ -361,6 +380,7 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                         this.interaction.latestApproximatedPoints = points;
                         canvasInstance.interact({
                             enabled: true,
+                            shapeType: ShapeType.POLYGON,
                             intermediateShape: {
                                 shapeType: ShapeType.POLYGON,
                                 points: this.interaction.latestApproximatedPoints.flat(),
@@ -373,9 +393,18 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
         if (
             prevState.convertMasksToPolygons !== convertMasksToPolygons &&
             maskThreshold !== null &&
-            this.interaction.latestResponse.mask?.length
+            this.interaction.latestResponse.mask?.length &&
+            mode === 'interaction' // ← CHỈ CHECK MODE
         ) {
             void this.updateMaskPreview(maskThreshold);
+        }
+
+        if (
+            prevProps.frame !== frame &&
+            mode === 'interaction' && // ← CHỈ CHECK MODE
+            this.interaction.id
+        ) {
+            void this.loadLogitForFrame(frame);
         }
 
         this.checkTrackedStates(prevProps);
@@ -383,9 +412,15 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
 
     public componentWillUnmount(): void {
         const { canvasInstance } = this.props;
+        this.isComponentUnmounted = true;
         onRemoveAnnotations(null);
         canvasInstance.html().removeEventListener('canvas.interacted', this.interactionListener);
         canvasInstance.html().removeEventListener('canvas.canceled', this.cancelListener);
+        this.logitAbortController?.abort();
+        if (this.sliderDebounceTimer !== null) {
+            window.clearTimeout(this.sliderDebounceTimer);
+            this.sliderDebounceTimer = null;
+        }
     }
 
     private getSupportedTrackers(): MLModel[] {
@@ -508,6 +543,7 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                     if (this.interaction.latestApproximatedPoints.length) {
                         canvasInstance.interact({
                             enabled: true,
+                            shapeType: ShapeType.POLYGON,
                             intermediateShape: {
                                 shapeType: ShapeType.POLYGON,
                                 points: this.interaction.latestApproximatedPoints.flat(),
@@ -1020,55 +1056,346 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
     }
 
     private async updateMaskPreview(threshold: number): Promise<void> {
+        return this.updateMaskPreviewSmooth(threshold);
+    }
+
+    private async updateMaskPreviewSmooth(threshold: number): Promise<void> {
+        if (!this.interaction.latestResponse.mask?.length) {
+            return;
+        }
+
+        if (this.maskPreviewUpdateInProgress) {
+            this.pendingMaskPreview = threshold;
+            return;
+        }
+
+        this.maskPreviewUpdateInProgress = true;
+
         try {
-            // 1. Lấy kích thước ảnh để tìm tâm
-            const { width, height } = (this.props.canvasInstance as any).geometry.image;
-            const centerX = width / 2;
-            const centerY = height / 2;
-
-            // 2. Tính bán kính dựa trên Slider (threshold)
-            // Quy tắc: Slider càng nhỏ (0.1) -> Hình càng TO. Slider càng lớn (0.9) -> Hình càng NHỎ
-            // Max Radius = 40% chiều rộng ảnh
-            const maxRadius = Math.min(width, height) * 0.4;
-
-            // Công thức: Radius = Max * (1.1 - giá trị slider)
-            const currentRadius = maxRadius * (1.1 - threshold);
-
-            // 3. Tạo các điểm Polygon cho hình tròn (Toán học cơ bản)
-            const points: number[] = [];
-            const segments = 30; // Số điểm để tạo thành hình tròn (càng cao càng tròn)
-
-            for (let i = 0; i < segments; i++) {
-                const angle = (i / segments) * 2 * Math.PI;
-                const x = centerX + currentRadius * Math.cos(angle);
-                const y = centerY + currentRadius * Math.sin(angle);
-                points.push(x, y);
+            if (this.state.mode !== 'interaction') {
+                return;
             }
 
-            // 4. Ra lệnh vẽ ngay lập tức
-            this.props.canvasInstance.interact({
-                enabled: true,
-                shapeType: 'polygon',
-                intermediateShape: {
-                    shapeType: 'polygon',
-                    points: points,
-                },
-            });
+            const normalized = clamp(threshold, 0, 1);
+            const currentInteractionId = this.interaction.id;
 
-            console.log(`Đã vẽ hình tròn bán kính: ${Math.floor(currentRadius)}px (Threshold: ${threshold})`);
+            if (!currentInteractionId || this.interaction.isAborted) {
+                return;
+            }
+
+            // Round threshold to 2 decimals for cache key
+            const cacheKey = Math.round(normalized * 100) / 100;
+
+            // Check cache first
+            let rle = this.rleCache.get(cacheKey);
+
+            if (!rle) {
+                // Compute RLE if not cached
+                const baseMask = this.interaction.latestResponse.mask as number[][];
+                const binarizedMask = this.binarizeMask(baseMask, normalized);
+                const bounds = this.interaction.latestResponse.bounds;
+                rle = this.composeRLEFromMask(binarizedMask, bounds);
+
+                // Cache the result (limit cache size to prevent memory issues)
+                if (this.rleCache.size > 50) {
+                    const firstKey = this.rleCache.keys().next().value;
+                    if (firstKey !== undefined) {
+                        this.rleCache.delete(firstKey);
+                    }
+                }
+                this.rleCache.set(cacheKey, rle);
+            }
+
+            if (!rle.length) {
+                return;
+            }
+
+            this.interaction.latestResponse.rle = rle;
+            this.interaction.latestResponse.threshold = normalized;
+
+            const { canvasInstance } = this.props;
+            const { convertMasksToPolygons } = this.state;
+
+            // Update immediately without requestAnimationFrame to avoid flickering
+            // The canvas will smoothly transition between intermediate shapes
+            if (convertMasksToPolygons) {
+                const [left, top] = this.interaction.latestResponse.bounds ?
+                    [this.interaction.latestResponse.bounds[0], this.interaction.latestResponse.bounds[1]] : [0, 0];
+
+                // For polygons, we still need async processing but do it synchronously
+                const binarizedMask = this.binarizeMask(
+                    this.interaction.latestResponse.mask as number[][],
+                    normalized
+                );
+
+                const polygonPoints = await this.receivePointsFromMask(binarizedMask, left, top);
+                const approximated = await this.approximateResponsePoints(polygonPoints);
+
+                if (this.interaction.id !== currentInteractionId || this.interaction.isAborted) {
+                    return;
+                }
+
+                this.interaction.latestApproximatedPoints = approximated;
+                this.interaction.latestResponse.points = polygonPoints;
+
+                // Update canvas immediately - canvas handles smooth transition
+                canvasInstance.interact({
+                    enabled: true,
+                    shapeType: ShapeType.POLYGON,
+                    intermediateShape: {
+                        shapeType: ShapeType.POLYGON,
+                        points: approximated.flat(),
+                    },
+                });
+
+                this.lastRenderedThreshold = normalized;
+            } else {
+                if (this.interaction.id !== currentInteractionId || this.interaction.isAborted) {
+                    return;
+                }
+
+                this.interaction.latestResponse.points = [];
+
+                // Update canvas immediately - canvas will smoothly update intermediateShape
+                // without clearing the previous mask
+                canvasInstance.interact({
+                    enabled: true,
+                    shapeType: ShapeType.MASK,
+                    intermediateShape: {
+                        shapeType: ShapeType.MASK,
+                        points: rle,
+                    },
+                });
+
+                this.lastRenderedThreshold = normalized;
+            }
 
         } catch (error) {
-            console.error(error);
+            console.error('💥 updateMaskPreview error:', error);
+        } finally {
+            this.maskPreviewUpdateInProgress = false;
+            if (this.pendingMaskPreview !== null) {
+                const pendingThreshold = this.pendingMaskPreview;
+                this.pendingMaskPreview = null;
+                await this.updateMaskPreviewSmooth(pendingThreshold);
+            }
+        }
+    }
+
+    private buildLogitAssetPathCandidates(frame: number): string[] {
+        const paddedFrame = (frame + 1).toString().padStart(4, '0');
+        // Use relative path from public directory
+        // In dev: files are served from /, in prod: from publicPath
+        const prefix = `/logits/slice_${paddedFrame}`;
+        return ['jpg', 'jpeg', 'png'].map((ext) => `${prefix}.${ext}`);
+    }
+
+    private async fetchLogitAsset(frame: number, signal: AbortSignal): Promise<{ blob: Blob; url: string }> {
+        const candidates = this.buildLogitAssetPathCandidates(frame);
+        let lastError: Error | null = null;
+
+        for (const url of candidates) {
+            try {
+                const response = await fetch(url, { signal, cache: 'force-cache' });
+                if (!response.ok) {
+                    if (response.status === 404) {
+                        console.log(`⚠️ 404 for ${url}, trying next candidate...`);
+                        continue;
+                    }
+
+                    throw new Error(`Failed to load logit map (${response.status} ${response.statusText})`);
+                }
+
+                const blob = await response.blob();
+                console.log(`✅ Successfully loaded logit: ${url}`);
+                return { blob, url };
+            } catch (error: any) {
+                if (error?.name === 'AbortError') {
+                    throw error;
+                }
+                lastError = error instanceof Error ? error : new Error(`Failed to load logit map: ${error.message}`);
+            }
+        }
+
+        throw lastError ?? new Error(`Logit map not found for frame ${frame}. Tried: ${candidates.join(', ')}`);
+    }
+
+    private async decodeLogitBlob(blob: Blob): Promise<LogitCacheEntry> {
+        let width = 0;
+        let height = 0;
+        let source: CanvasImageSource | null = null;
+        let bitmap: ImageBitmap | null = null;
+        try {
+            if (typeof createImageBitmap === 'function') {
+                bitmap = await createImageBitmap(blob);
+                width = bitmap.width;
+                height = bitmap.height;
+                source = bitmap;
+            } else {
+                const imageElement = await this.loadImageFromBlob(blob);
+                width = imageElement.naturalWidth || imageElement.width;
+                height = imageElement.naturalHeight || imageElement.height;
+                source = imageElement;
+            }
+
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx || !source) {
+                throw new Error('Unable to create 2D canvas context');
+            }
+
+            ctx.drawImage(source, 0, 0);
+            const { data } = ctx.getImageData(0, 0, width, height);
+            const map: number[][] = new Array(height);
+            for (let y = 0; y < height; y++) {
+                const row = new Array<number>(width);
+                for (let x = 0; x < width; x++) {
+                    const idx = (y * width + x) * 4;
+                    row[x] = data[idx] / 255;
+                }
+                map[y] = row;
+            }
+
+            return {
+                map,
+                width,
+                height,
+            };
+        } finally {
+            if (bitmap && typeof bitmap.close === 'function') {
+                bitmap.close();
+            }
+        }
+    }
+
+    private loadImageFromBlob(blob: Blob): Promise<HTMLImageElement> {
+        return new Promise((resolve, reject) => {
+            const url = URL.createObjectURL(blob);
+            const image = new Image();
+            image.onload = () => {
+                URL.revokeObjectURL(url);
+                resolve(image);
+            };
+            image.onerror = (event) => {
+                URL.revokeObjectURL(url);
+                reject(new Error(`Failed to decode logit map (${(event as ErrorEvent)?.message || 'unknown error'})`));
+            };
+            image.src = url;
+        });
+    }
+
+    private async requestLogit(frame: number, signal: AbortSignal): Promise<LogitCacheEntry> {
+        const { blob } = await this.fetchLogitAsset(frame, signal);
+        return this.decodeLogitBlob(blob);
+    }
+
+    private async loadLogitForFrame(frame: number): Promise<void> {
+        if (!this.interaction.id) {
+            this.interaction.id = lodash.uniqueId('interaction_');
+        }
+        this.interaction.isAborted = false;
+        this.pendingMaskPreview = null;
+        this.maskPreviewUpdateInProgress = false;
+        if (this.isComponentUnmounted) {
+            return;
+        }
+
+        this.logitAbortController?.abort();
+        const abortController = new AbortController();
+        this.logitAbortController = abortController;
+        const requestSeq = ++this.logitLoadSeq;
+
+        if (!this.isComponentUnmounted) {
+            this.setState({
+                logitLoading: true,
+                pointsReceived: false,
+            });
+        }
+
+        try {
+            const cached = this.logitCache.get(frame);
+            const entry = cached ?? await this.requestLogit(frame, abortController.signal);
+            if (!cached) {
+                this.logitCache.set(frame, entry);
+            }
+
+            if (requestSeq !== this.logitLoadSeq) {
+                return;
+            }
+
+            this.interaction.latestResponse = {
+                ...this.interaction.latestResponse,
+                rle: [],
+                mask: entry.map,
+                points: [],
+                bounds: [0, 0, entry.width - 1, entry.height - 1],
+                threshold: null,
+            };
+            this.interaction.latestApproximatedPoints = [];
+            this.lastRenderedThreshold = null; // Reset when loading new frame
+            this.rleCache.clear(); // Clear cache when loading new frame
+
+            const defaultThreshold = 0.5;
+            if (!this.isComponentUnmounted) {
+                this.setState({
+                    maskThreshold: defaultThreshold,
+                    pointsReceived: true,
+                });
+            }
+
+            await this.updateMaskPreview(defaultThreshold);
+        } catch (error: any) {
+            if (error?.name === 'AbortError') {
+                return;
+            }
+
+            notification.warning({
+                message: 'Logit map unavailable',
+                description: <CVATMarkdown>{(error as Error).message}</CVATMarkdown>,
+                duration: null,
+            });
+
+            this.interaction.latestResponse.mask = [];
+            if (!this.isComponentUnmounted) {
+                this.setState({
+                    maskThreshold: null,
+                    pointsReceived: false,
+                });
+            }
+        } finally {
+            if (requestSeq === this.logitLoadSeq) {
+                if (!this.isComponentUnmounted) {
+                    this.setState({ logitLoading: false });
+                }
+                if (this.logitAbortController === abortController) {
+                    this.logitAbortController = null;
+                }
+            }
         }
     }
 
     private handleMaskThresholdSliderChange = (value: number): void => {
         const normalized = clamp(value, 0, 1);
+        // Update state immediately for responsive UI
         this.setState({ maskThreshold: normalized });
 
-        if (this.interaction.latestResponse.mask?.length) {
-            void this.updateMaskPreview(normalized);
+        // Clear previous debounce timer
+        if (this.sliderDebounceTimer !== null) {
+            window.clearTimeout(this.sliderDebounceTimer);
+            this.sliderDebounceTimer = null;
         }
+
+        // Very short debounce (8ms) for smooth updates without flickering
+        // This allows updates during drag while preventing excessive renders
+        this.sliderDebounceTimer = window.setTimeout(() => {
+            this.sliderDebounceTimer = null;
+            if (this.interaction.latestResponse.mask?.length && !this.isComponentUnmounted) {
+                // Update immediately without checking threshold diff for smoother experience
+                void this.updateMaskPreviewSmooth(normalized);
+            }
+        }, 8); // Very short debounce for responsiveness
     };
 
     private handleMaskThresholdInputChange = (value: number | string | null): void => {
@@ -1218,7 +1545,7 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
 
     private renderInteractorBlock(): JSX.Element {
         const {
-            interactors, canvasInstance, labels, onInteractionStart,
+            interactors, canvasInstance, labels, onInteractionStart, frame,
         } = this.props;
         const {
             activeInteractor,
@@ -1227,25 +1554,25 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
             startInteractingWithBox,
             convertMasksToPolygons,
             maskThreshold,
+            logitLoading,
         } = this.state;
-/*
-        if (!interactors.length) {
-            return (
 
-                <Row justify='center' align='middle' style={{ marginTop: '5px' }}>
-                    <Col>
-                        <Text type='warning' className='cvat-text-color'>
-                            No available interactors found
-                        </Text>
-                    </Col>
-                </Row>
-            );
-        }
-*/
+        // if (!interactors.length) {
+        //     return (
+        //         <Row justify='center' align='middle' style={{ marginTop: '5px' }}>
+        //             <Col>
+        //                 <Text type='warning' className='cvat-text-color'>
+        //                     No available interactors found
+        //                 </Text>
+        //             </Col>
+        //         </Row>
+        //     );
+        // }
+
         const minNegVertices = activeInteractor?.params?.canvas?.minNegVertices ?? -1;
         const renderStartWithBox = activeInteractor?.params?.canvas?.startWithBoxOptional ?? false;
-        const maskAvailable = true;
-        const thresholdValue = maskThreshold ?? 0;
+        const maskAvailable = Boolean(this.interaction.latestResponse.mask?.length) && !logitLoading;
+        const thresholdValue = maskThreshold ?? 0.5;
 
         return (
             <>
@@ -1310,7 +1637,7 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                                     step={0.01}
                                     value={thresholdValue}
                                     onChange={this.handleMaskThresholdSliderChange}
-                                    disabled={!maskAvailable}
+                            disabled={!maskAvailable}
                                 />
                             </Col>
                             <Col span={8}>
@@ -1320,7 +1647,7 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                                     step={0.01}
                                     value={maskThreshold ?? undefined}
                                     onChange={this.handleMaskThresholdInputChange}
-                                    disabled={!maskAvailable}
+                            disabled={!maskAvailable}
                                     style={{ width: '100%' }}
                                 />
                             </Col>
@@ -1339,37 +1666,65 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                 </div>
                 <Row align='middle' justify='end'>
                     <Col>
-                        <Button
-                            type='primary'
-                            loading={fetching}
-                            className='cvat-tools-interact-button'
-                            disabled={fetching}
-                            onClick={async() => {
-                                // 1. Chuyển sang chế độ interaction
-                                this.setState({ mode: 'interaction' });
+                    <Button
+    type='primary'
+    loading={fetching}
+    className='cvat-tools-interact-button'
+    disabled={fetching} // Chỉ khóa khi đang tải, không khóa khi thiếu model
+    onClick={async () => {
+        try {
+            console.log("=== INTERACT WITH LOGIT (No Server) ===");
 
-                                // 2. Giả lập dữ liệu để Slider hoạt động (để không bị crash check null)
-                                this.interaction.id = lodash.uniqueId('interaction_');
-                                this.interaction.isAborted = false;
-                                // Fake mask rỗng để qua mặt các bước kiểm tra
-                                this.interaction.latestResponse = {
-                                    rle: [], points: [], mask: [[1]], threshold: 0.5, bounds: [0, 0, 100, 100],
-                                };
+            const { frame, canvasInstance } = this.props;
+            const { activeLabelID } = this.state;
 
-                                // 3. Gọi hàm vẽ lần đầu tiên (với giá trị 0.5)
-                                this.updateMaskPreview(0.5);
+            // 1. Validate
+            if (!activeLabelID) {
+                notification.warning({
+                    message: 'Please select a label first',
+                });
+                return;
+            }
 
-                                // 4. Cập nhật UI để hiện Slider
-                                this.setState({
-                                    pointsReceived: true,
-                                    maskThreshold: 0.5
-                                });
+            console.log("1. Frame:", frame, "Label:", activeLabelID);
 
-                                console.log("Bắt đầu chế độ Hack Slider!");
-                            }}
-                        >
-                            Interact
-                        </Button>
+            // 2. Set mode
+            this.setState({ mode: 'interaction' });
+            console.log("2. Mode set to 'interaction'");
+
+            // 3. ✅ KHÔNG GỌI onInteractionStart - Chỉ cancel canvas cũ
+            canvasInstance.cancel();
+            console.log("3. Canvas cleared");
+
+            // 4. Initialize interaction state
+            this.interaction.id = lodash.uniqueId('interaction_');
+            this.interaction.isAborted = false;
+            this.interaction.latestResponse = {
+                rle: [],
+                points: [],
+                mask: [[1]], // Placeholder
+                threshold: 0.5,
+                bounds: [0, 0, 1, 1],
+            };
+            console.log("4. Interaction state initialized, ID:", this.interaction.id);
+
+            // 5. Load logit image
+            console.log("5. Loading logit for frame:", frame);
+            await this.loadLogitForFrame(frame);
+
+            console.log("✅ Interact completed successfully!");
+
+        } catch (e) {
+            console.error("❌ Error in Interact:", e);
+            notification.error({
+                message: 'Failed to load logit',
+                description: e instanceof Error ? e.message : String(e),
+            });
+        }
+    }}
+>
+    Interact
+</Button>
                     </Col>
                 </Row>
             </>

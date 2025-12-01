@@ -56,10 +56,18 @@ module.exports = (env) => {
                 overlay: false,
                 webSocketURL: 'ws://0.0.0.0:0/ws',
             },
-            historyApiFallback: true,
-            static: {
-                directory: path.join(__dirname, 'dist'),
+            historyApiFallback: {
+                disableDotRule: true,
             },
+            static: [
+                {
+                    directory: path.join(__dirname, 'dist'),
+                },
+                {
+                    directory: path.join(__dirname, 'public'),
+                    publicPath: '/',
+                },
+            ],
             headers: {
                 // to enable SharedArrayBuffer and ONNX multithreading
                 // https://cloudblogs.microsoft.com/opensource/2021/09/02/onnx-runtime-web-running-your-machine-learning-model-in-browser/
@@ -196,6 +204,11 @@ module.exports = (env) => {
                     {
                         from: 'src/assets/*.png',
                         to  : 'assets/[name][ext]',
+                    },
+                    {
+                        from: 'public/logits',
+                        to  : 'logits',
+                        noErrorOnMissing: true,
                     },
                     {
                         from: 'plugins/**/assets/*.(onnx|js)',
