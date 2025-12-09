@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional, Union, cast
-
+from cvat.apps.engine.models import FrameLogitMeta
 import django_rq
 from attr.converters import to_bool
 from django.conf import settings
@@ -77,6 +77,7 @@ from cvat.apps.engine.models import (
     CloudStorage,
     Comment,
     Data,
+    FrameLogitMeta,
     Issue,
     Job,
     JobType,
@@ -1846,7 +1847,6 @@ class JobViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.CreateMo
 
             annotations = dm.task.get_job_data(self._object.pk)
             return Response(annotations)
-
         elif request.method == 'POST' or request.method == 'OPTIONS':
             return self.upload_data(request)
 
@@ -1880,6 +1880,118 @@ class JobViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.CreateMo
                 except (AttributeError, IntegrityError) as e:
                     return Response(data=str(e), status=status.HTTP_400_BAD_REQUEST)
                 return Response(data)
+
+    @extend_schema(
+        methods=["GET"],
+        summary="Get logit image for a specific frame in a job",
+        description="Returns a precomputed logit image for the given job frame.",
+        responses={
+            200: OpenApiResponse(description="Logit image returned"),
+            404: OpenApiResponse(description="Logit/Frame not found"),
+        },
+    )
+    # 👇 SỬA URL_PATH: Bỏ dấu $ ở cuối và dấu ^ ở đầu (nếu có)
+    @action(
+        detail=True,
+        methods=["GET"],
+        url_path=r"logits/(?P<frame>\d+)",
+        serializer_class=None,
+        parser_classes=[],
+    )
+    def logits(self, request, pk=None, frame=None):
+        """
+        GET /api/jobs/<job_id>/logits/<frame>
+        """
+        print(f"📡 API LOGITS CALLED: Job={pk}, Frame={frame}")
+
+        # 1. Import tại chỗ để tránh lỗi NameError/ImportError
+        import os
+        import traceback
+        from django.http import HttpResponse
+        from rest_framework.exceptions import NotFound
+        from cvat.apps.engine.models import FrameLogitMeta
+
+        # 2. Lấy Job (Trigger check quyền)
+        try:
+            job = self.get_object()
+        except Exception as e:
+            print(f"🔥 Error getting job: {e}")
+            print(traceback.format_exc())
+            raise NotFound(f"Job not found: {pk}")
+
+        # 3. Validate Frame Number
+        try:
+            if frame is None:
+                raise ValueError("Frame is None")
+            frame_number = int(frame)
+            print(f"   Frame number parsed: {frame_number} (type: {type(frame_number)})")
+        except (TypeError, ValueError) as e:
+            print(f"❌ Invalid frame number: {frame}, error: {e}")
+            raise NotFound(f"Invalid frame number: {frame}")
+
+        # 4. Tìm Metadata trong DB
+        # Thêm .first() để tránh lỗi MultipleObjectsReturned nếu lỡ tay import trùng
+        try:
+            meta = FrameLogitMeta.objects.filter(job=job, frame=frame_number).first()
+            print(f"   Metadata query: job={job.id}, frame={frame_number}, found={meta is not None}")
+        except Exception as e:
+            print(f"🔥 Error querying database: {e}")
+            print(traceback.format_exc())
+            raise NotFound(f"Database error: {str(e)}")
+
+        if not meta:
+            print(f"❌ Metadata not found for Job {job.id} Frame {frame_number}")
+            # Debug: In ra thử xem trong DB có gì
+            try:
+                exists = FrameLogitMeta.objects.filter(job=job).count()
+                all_frames = list(FrameLogitMeta.objects.filter(job=job).values_list('frame', flat=True))
+                print(f"   (Job này có tổng cộng {exists} bản ghi logit)")
+                print(f"   (Các frame có logit: {sorted(all_frames)})")
+            except Exception as e:
+                print(f"   (Lỗi khi query frames: {e})")
+            raise NotFound("Logit map not found in database")
+
+        # 5. Kiểm tra File
+        try:
+            full_path = meta.get_full_path()
+            print(f"   Full path: {full_path}")
+            print(f"   Path exists: {os.path.exists(full_path)}")
+            if not os.path.exists(full_path):
+                # Kiểm tra thêm xem thư mục có tồn tại không
+                dir_path = os.path.dirname(full_path)
+                print(f"   Directory exists: {os.path.exists(dir_path)}")
+                print(f"   Directory path: {dir_path}")
+                raise NotFound("Logit file missing on disk")
+        except NotFound:
+            raise
+        except Exception as e:
+            print(f"🔥 Error checking file path: {e}")
+            print(traceback.format_exc())
+            raise NotFound(f"Error accessing file: {str(e)}")
+
+        # 6. Trả về ảnh
+        try:
+            # Fallback mime type đơn giản
+            mime_type = meta.mime_type or "image/png"
+
+            with open(full_path, "rb") as fp:
+                content = fp.read()
+
+            print(f"✅ Returning image: {len(content)} bytes, mime_type: {mime_type}")
+            response = HttpResponse(content, content_type=mime_type)
+            response["Content-Length"] = str(len(content))
+            return response
+
+        except FileNotFoundError:
+            print(f"🔥 File not found: {full_path}")
+            raise NotFound("Logit file not found on disk")
+        except PermissionError as e:
+            print(f"🔥 Permission error: {e}")
+            raise NotFound(f"Permission denied: {str(e)}")
+        except Exception as e:
+            print(f"🔥 Error reading file: {e}")
+            print(traceback.format_exc())
+            raise NotFound(f"Error reading file: {str(e)}")
 
 
     @tus_chunk_action(detail=True, suffix_base="annotations")

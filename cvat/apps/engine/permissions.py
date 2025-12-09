@@ -897,6 +897,7 @@ class JobPermission(OpenPolicyAgentPermission, DownloadExportedExtension):
             ('append_annotations_chunk', 'PATCH'): Scopes.UPDATE_ANNOTATIONS,
             ('append_annotations_chunk', 'HEAD'): Scopes.UPDATE_ANNOTATIONS,
             ('data', 'GET'): Scopes.VIEW_DATA,
+            ('logits', 'GET'): Scopes.VIEW,
             ('metadata','GET'): Scopes.VIEW_METADATA,
             ('metadata','PATCH'): Scopes.UPDATE_METADATA,
             ('initiate_dataset_export', 'POST'): Scopes.EXPORT_DATASET if is_dataset_export(request) else Scopes.EXPORT_ANNOTATIONS,

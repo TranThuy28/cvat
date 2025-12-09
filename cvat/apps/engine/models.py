@@ -1017,6 +1017,41 @@ class Job(TimestampedModel, AssignableModel, FileSystemRelatedModel):
         os.makedirs(job_path)
 
 
+class FrameLogitMeta(models.Model):
+    """
+    Metadata for per-frame logit files associated with a job.
+
+    The actual logit data is stored on disk under DATA_ROOT, this model only
+    keeps a lightweight mapping (job, frame) -> relative file path + mime type.
+    """
+
+    job = models.ForeignKey(
+        Job,
+        on_delete=models.CASCADE,
+        related_name='frame_logits',
+        related_query_name='frame_logit',
+    )
+    frame = models.PositiveIntegerField()
+    # Relative path from settings.DATA_ROOT to the logit file location
+    relative_path = models.CharField(max_length=1024)
+    mime_type = models.CharField(max_length=64, default='image/png')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        default_permissions = ()
+        unique_together = ('job', 'frame')
+
+    def __str__(self) -> str:
+        return f'Logit(job={self.job_id}, frame={self.frame})'
+
+    def get_full_path(self) -> str:
+        """
+        Build an absolute path to the logit file based on DATA_ROOT and the
+        stored relative path.
+        """
+        return os.path.join(settings.DATA_ROOT, self.relative_path)
+
+
 class InvalidLabel(ValueError):
     pass
 

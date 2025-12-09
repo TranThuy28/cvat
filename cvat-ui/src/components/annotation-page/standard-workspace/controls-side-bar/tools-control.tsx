@@ -1183,11 +1183,11 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
     }
 
     private buildLogitAssetPathCandidates(frame: number): string[] {
-        const paddedFrame = (frame + 1).toString().padStart(4, '0');
-        // Use relative path from public directory
-        // In dev: files are served from /, in prod: from publicPath
-        const prefix = `/logits/slice_${paddedFrame}`;
-        return ['jpg', 'jpeg', 'png'].map((ext) => `${prefix}.${ext}`);
+        const { jobInstance } = this.props;
+        // Backend endpoint: GET /api/jobs/<job_id>/logits/<frame>
+        // The backend is responsible for returning the correct image format.
+        const base = `/api/jobs/${jobInstance.id}/logits/${frame}`;
+        return [base];
     }
 
     private async fetchLogitAsset(frame: number, signal: AbortSignal): Promise<{ blob: Blob; url: string }> {
@@ -1196,7 +1196,11 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
 
         for (const url of candidates) {
             try {
-                const response = await fetch(url, { signal, cache: 'force-cache' });
+                const response = await fetch(url, {
+                    signal,
+                    cache: 'force-cache',
+                    credentials: 'include',
+                });
                 if (!response.ok) {
                     if (response.status === 404) {
                         console.log(`⚠️ 404 for ${url}, trying next candidate...`);
