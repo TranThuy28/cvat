@@ -157,6 +157,8 @@ interface State {
     portals: React.ReactPortal[];
     maskThreshold: number | null;
     logitLoading: boolean;
+    frozen: boolean; // đã commit annotation, không cho slider ghi đè
+    frozenAnnotationIds: number[]; // server ids của annotation đã đóng băng (để xóa khi reset AI)
 }
 
 interface LogitCacheEntry {
@@ -275,6 +277,8 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
             portals: [],
             maskThreshold: null,
             logitLoading: false,
+            frozen: false,
+            frozenAnnotationIds: [],
         };
 
         this.interaction = {
@@ -338,6 +342,8 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                 this.interaction.hideMessage();
                 this.interaction.hideMessage = null;
             }
+            // khi thoát AI mode, bỏ trạng thái đóng băng
+            this.setState({ frozen: false, frozenAnnotationIds: [] });
         } else if (!prevProps.isActivated && isActivated) {
             // reset flags when start interaction/tracking
             this.interaction = {
@@ -361,6 +367,8 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                 approxPolyAccuracy: defaultApproxPolyAccuracy,
                 pointsReceived: false,
                 maskThreshold: null,
+                frozen: false,
+                frozenAnnotationIds: [],
             });
             window.addEventListener('contextmenu', this.contextmenuDisabler);
         }
@@ -589,9 +597,7 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
             // prevent future requests if possible
             this.interaction.isAborted = true;
             this.interaction.latestRequest = null;
-            if (this.interaction.latestApproximatedPoints.length) {
-                this.constructFromPoints();
-            }
+            // KHÔNG auto lưu nữa. Người dùng sẽ bấm nút “Finish” để commit (freeze)
         } else if (shapesUpdated) {
             const interactor = activeInteractor as MLModel;
             this.interaction.latestRequest = {
@@ -1008,6 +1014,124 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
         }
     }
 
+    /**
+     * Đóng băng (commit) polygon đang preview thành annotation thật (luôn là polygon).
+     * Không ghi đè nếu chưa có dữ liệu hoặc chưa chọn label.
+     */
+    private async commitPreviewAsPolygon(): Promise<void> {
+        const { frame, labels, curZOrder, jobInstance, fetchAnnotations } = this.props;
+        const { activeLabelID } = this.state;
+
+        if (!activeLabelID) {
+            notification.warning({
+                message: 'Chưa chọn label',
+                description: 'Hãy chọn label trước khi đóng băng kết quả.',
+            });
+            return;
+        }
+
+        if (!this.interaction.latestApproximatedPoints.length) {
+            notification.warning({
+                message: 'Chưa có kết quả để lưu',
+                description: 'Hãy kéo slider/nhận logit trước khi bấm Finish.',
+            });
+            return;
+        }
+
+        const label = labels.find((l) => l.id === activeLabelID);
+        if (!label) {
+            notification.error({
+                message: 'Label không hợp lệ',
+                description: `Không tìm thấy label id=${activeLabelID}`,
+            });
+            return;
+        }
+
+        try {
+            const object = new core.classes.ObjectState({
+                frame,
+                objectType: ObjectType.SHAPE,
+                source: core.enums.Source.SEMI_AUTO,
+                label,
+                shapeType: ShapeType.POLYGON,
+                points: this.interaction.latestApproximatedPoints.flat(),
+                occluded: false,
+                zOrder: curZOrder,
+            });
+
+            const createdIds = await jobInstance.annotations.put([object]);
+            await fetchAnnotations();
+
+            this.setState({ frozen: true, frozenAnnotationIds: createdIds ?? [] });
+            message.success('Đã đóng băng kết quả (polygon) và lưu vào annotation');
+        } catch (error: any) {
+            notification.error({
+                message: 'Lưu annotation thất bại',
+                description: <CVATMarkdown>{error?.message || 'Unknown error'}</CVATMarkdown>,
+                duration: null,
+            });
+        }
+    }
+
+    /**
+     * Reset về AI preview: xóa annotation đã đóng băng (nếu có) và mở slider lại.
+     */
+    private async resetFrozenAnnotations(): Promise<void> {
+        const { jobInstance, fetchAnnotations, frame } = this.props;
+        const { frozenAnnotationIds } = this.state;
+
+        if (!this.state.frozen) {
+            return;
+        }
+
+        this.setState({ fetching: true });
+        try {
+            if (frozenAnnotationIds.length) {
+                // API hiện có hỗ trợ remove() với ObjectState, không có delete(ids) trong typings
+                const statesToDelete = await jobInstance.annotations.get(frame, false, []);
+                const targetIds = new Set(frozenAnnotationIds);
+                const removeCandidates = statesToDelete.filter(
+                    (st: any) => st.id !== undefined && targetIds.has(st.id),
+                );
+                if (removeCandidates.length) {
+                    // Fallback xoá lần lượt; typing không khai báo delete, dùng any để tránh lint
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const annAny: any = jobInstance.annotations as any;
+                    for (const st of removeCandidates) {
+                        await annAny.delete([st]);
+                    }
+                }
+                await fetchAnnotations();
+            }
+            this.setState({
+                frozen: false,
+                frozenAnnotationIds: [],
+            });
+            message.success('Đã reset về AI preview. Bạn có thể kéo slider lại.');
+        } catch (error: any) {
+            notification.error({
+                message: 'Không thể reset',
+                description: <CVATMarkdown>{error?.message || 'Unknown error'}</CVATMarkdown>,
+                duration: null,
+            });
+        } finally {
+            this.setState({ fetching: false });
+        }
+    }
+
+    /**
+     * Hộp thoại xác nhận khi muốn kéo slider sau khi đã freeze.
+     */
+    private confirmResetFrozen(): void {
+        Modal.confirm({
+            title: 'Reset về AI preview?',
+            content: 'Các chỉnh sửa tay sẽ mất. Tiếp tục?',
+            okText: 'Reset',
+            cancelText: 'Hủy',
+            onOk: () => this.resetFrozenAnnotations(),
+        });
+    }
+
     private async initializeOpenCV(): Promise<void> {
         if (!openCVWrapper.isInitialized) {
             const hide = message.loading('OpenCV client initialization..', 0);
@@ -1302,6 +1426,10 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
         this.interaction.isAborted = false;
         this.pendingMaskPreview = null;
         this.maskPreviewUpdateInProgress = false;
+        // mỗi lần load logit mới thì bỏ trạng thái đóng băng
+        if (!this.isComponentUnmounted) {
+            this.setState({ frozen: false, frozenAnnotationIds: [] });
+        }
         if (this.isComponentUnmounted) {
             return;
         }
@@ -1382,6 +1510,13 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
 
     private handleMaskThresholdSliderChange = (value: number): void => {
         const normalized = clamp(value, 0, 1);
+
+        // Nếu đã đóng băng thì xác nhận reset: xóa annotation đã lưu và mở lại AI preview
+        if (this.state.frozen) {
+            this.confirmResetFrozen();
+            return;
+        }
+
         // Update state immediately for responsive UI
         this.setState({ maskThreshold: normalized });
 
@@ -1408,6 +1543,11 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
         }
 
         const normalized = clamp(value, 0, 1);
+        if (this.state.frozen) {
+            this.confirmResetFrozen();
+            return;
+        }
+
         this.setState({ maskThreshold: normalized });
 
         if (this.interaction.latestResponse.mask?.length) {
@@ -1559,6 +1699,9 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
             convertMasksToPolygons,
             maskThreshold,
             logitLoading,
+            pointsReceived,
+            frozen,
+            frozenAnnotationIds,
         } = this.state;
 
         // if (!interactors.length) {
@@ -1641,7 +1784,7 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                                     step={0.01}
                                     value={thresholdValue}
                                     onChange={this.handleMaskThresholdSliderChange}
-                            disabled={!maskAvailable}
+                                    disabled={!maskAvailable || this.state.frozen}
                                 />
                             </Col>
                             <Col span={8}>
@@ -1651,12 +1794,34 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                                     step={0.01}
                                     value={maskThreshold ?? undefined}
                                     onChange={this.handleMaskThresholdInputChange}
-                            disabled={!maskAvailable}
+                                    disabled={!maskAvailable || this.state.frozen}
                                     style={{ width: '100%' }}
                                 />
                             </Col>
                         </Row>
                     </div>
+
+                    <Row justify='space-between' align='middle' style={{ marginTop: 8 }}>
+                        <Col>
+                            {this.state.frozen ? (
+                                <Text type='success'>Đã đóng băng (polygon)</Text>
+                            ) : (
+                                <Text type='secondary'>Preview chưa lưu</Text>
+                            )}
+                        </Col>
+                        <Col>
+                            <Button
+                                type='primary'
+                                disabled={!maskAvailable || !pointsReceived || logitLoading || fetching || this.state.frozen}
+                                loading={fetching}
+                                onClick={() => {
+                                    void this.commitPreviewAsPolygon();
+                                }}
+                            >
+                                Finish (Freeze)
+                            </Button>
+                        </Col>
+                    </Row>
 
                     {renderStartWithBox && (
                         <div>
@@ -1693,7 +1858,7 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
             console.log("1. Frame:", frame, "Label:", activeLabelID);
 
             // 2. Set mode
-            this.setState({ mode: 'interaction' });
+            this.setState({ mode: 'interaction', frozen: false });
             console.log("2. Mode set to 'interaction'");
 
             // 3. ✅ KHÔNG GỌI onInteractionStart - Chỉ cancel canvas cũ
