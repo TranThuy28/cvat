@@ -1052,6 +1052,36 @@ class FrameLogitMeta(models.Model):
         return os.path.join(settings.DATA_ROOT, self.relative_path)
 
 
+class FrameLogit(models.Model):
+    """
+    Stores logit map data directly in the database as binary blobs.
+
+    This model stores 16-bit PNG image data directly in the database,
+    eliminating the need for file system storage.
+    """
+
+    job = models.ForeignKey(
+        Job,
+        on_delete=models.CASCADE,
+        related_name='logits',
+        related_query_name='logit',
+    )
+    frame = models.PositiveIntegerField()
+    data = models.BinaryField()  # Stores the 16-bit PNG bytes
+    dtype = models.CharField(max_length=32, default='float32')
+    compression = models.CharField(max_length=32, default='png_16bit')
+    width = models.PositiveSmallIntegerField()
+    height = models.PositiveSmallIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        default_permissions = ()
+        unique_together = ('job', 'frame')
+
+    def __str__(self) -> str:
+        return f'FrameLogit(job={self.job_id}, frame={self.frame}, {self.width}x{self.height})'
+
+
 class InvalidLabel(ValueError):
     pass
 

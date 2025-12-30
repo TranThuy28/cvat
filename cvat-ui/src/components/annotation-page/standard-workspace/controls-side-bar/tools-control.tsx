@@ -1309,12 +1309,15 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
     private buildLogitAssetPathCandidates(frame: number): string[] {
         const { jobInstance } = this.props;
         // Backend endpoint: GET /api/jobs/<job_id>/logits/<frame>
-        // The backend is responsible for returning the correct image format.
+        // Returns 16-bit PNG image (content-type: image/png)
+        // The backend stores 16-bit PNG in database, but browser canvas will render as 8-bit
         const base = `/api/jobs/${jobInstance.id}/logits/${frame}`;
         return [base];
     }
 
     private async fetchLogitAsset(frame: number, signal: AbortSignal): Promise<{ blob: Blob; url: string }> {
+        // Fetch logit map from new API endpoint: /api/jobs/{job_id}/logits/{frame}
+        // Backend returns 16-bit PNG image (content-type: image/png) as binary blob
         const candidates = this.buildLogitAssetPathCandidates(frame);
         let lastError: Error | null = null;
 
@@ -1334,8 +1337,9 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                     throw new Error(`Failed to load logit map (${response.status} ${response.statusText})`);
                 }
 
+                // Response is a 16-bit PNG image, get as blob
                 const blob = await response.blob();
-                console.log(`✅ Successfully loaded logit: ${url}`);
+                console.log(`✅ Successfully loaded logit: ${url} (${blob.size} bytes, type: ${blob.type})`);
                 return { blob, url };
             } catch (error: any) {
                 if (error?.name === 'AbortError') {
@@ -1354,6 +1358,8 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
         let source: CanvasImageSource | null = null;
         let bitmap: ImageBitmap | null = null;
         try {
+            // Decode the 16-bit PNG blob using createImageBitmap (preferred) or Image element
+            // Note: Browser canvas will automatically downsample 16-bit PNG to 8-bit (0-255) for display
             if (typeof createImageBitmap === 'function') {
                 bitmap = await createImageBitmap(blob);
                 width = bitmap.width;
@@ -1366,22 +1372,36 @@ export class ToolsControlComponent extends React.PureComponent<Props, State> {
                 source = imageElement;
             }
 
+            // Create canvas to extract pixel data
             const canvas = document.createElement('canvas');
             canvas.width = width;
             canvas.height = height;
-            const ctx = canvas.getContext('2d');
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
             if (!ctx || !source) {
                 throw new Error('Unable to create 2D canvas context');
             }
 
+            // Draw the image to canvas (browser will render 16-bit PNG as 8-bit)
             ctx.drawImage(source, 0, 0);
+
+            // Extract pixel data (RGBA format: 4 bytes per pixel)
             const { data } = ctx.getImageData(0, 0, width, height);
+
+            // Convert to 2D array of probabilities (0.0 to 1.0)
+            // CRITICAL NORMALIZATION:
+            // - Backend stores 16-bit PNG (0-65535) in database
+            // - Browser canvas downsamples to 8-bit (0-255) for display
+            // - We need probabilities (0.0-1.0) for mask threshold logic
+            // - Since canvas gives us 8-bit values, divide by 255
+            // - If we could access raw 16-bit (future), we'd divide by 65535
             const map: number[][] = new Array(height);
             for (let y = 0; y < height; y++) {
                 const row = new Array<number>(width);
                 for (let x = 0; x < width; x++) {
-                    const idx = (y * width + x) * 4;
-                    row[x] = data[idx] / 255;
+                    const idx = (y * width + x) * 4; // RGBA: 4 bytes per pixel
+                    // For grayscale logit maps, R=G=B, so we use the red channel
+                    // Normalize 8-bit value (0-255) to probability (0.0-1.0)
+                    row[x] = data[idx] / 255.0;
                 }
                 map[y] = row;
             }

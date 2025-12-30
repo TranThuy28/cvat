@@ -1901,15 +1901,17 @@ class JobViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.CreateMo
     def logits(self, request, pk=None, frame=None):
         """
         GET /api/jobs/<job_id>/logits/<frame>
+
+        Returns 16-bit PNG logit map image stored in FrameLogit model (database).
+        The image is stored as binary data and returned with content-type: image/png
         """
         print(f"📡 API LOGITS CALLED: Job={pk}, Frame={frame}")
 
         # 1. Import tại chỗ để tránh lỗi NameError/ImportError
-        import os
         import traceback
         from django.http import HttpResponse
         from rest_framework.exceptions import NotFound
-        from cvat.apps.engine.models import FrameLogitMeta
+        from cvat.apps.engine.models import FrameLogit
 
         # 2. Lấy Job (Trigger check quyền)
         try:
@@ -1929,69 +1931,58 @@ class JobViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.CreateMo
             print(f"❌ Invalid frame number: {frame}, error: {e}")
             raise NotFound(f"Invalid frame number: {frame}")
 
-        # 4. Tìm Metadata trong DB
-        # Thêm .first() để tránh lỗi MultipleObjectsReturned nếu lỡ tay import trùng
+        # 4. Query FrameLogit from database (binary blob storage)
         try:
-            meta = FrameLogitMeta.objects.filter(job=job, frame=frame_number).first()
-            print(f"   Metadata query: job={job.id}, frame={frame_number}, found={meta is not None}")
+            frame_logit = FrameLogit.objects.filter(job=job, frame=frame_number).first()
+            print(f"   FrameLogit query: job={job.id}, frame={frame_number}, found={frame_logit is not None}")
         except Exception as e:
             print(f"🔥 Error querying database: {e}")
             print(traceback.format_exc())
             raise NotFound(f"Database error: {str(e)}")
 
-        if not meta:
-            print(f"❌ Metadata not found for Job {job.id} Frame {frame_number}")
+        if not frame_logit:
+            print(f"❌ FrameLogit not found for Job {job.id} Frame {frame_number}")
             # Debug: In ra thử xem trong DB có gì
             try:
-                exists = FrameLogitMeta.objects.filter(job=job).count()
-                all_frames = list(FrameLogitMeta.objects.filter(job=job).values_list('frame', flat=True))
+                exists = FrameLogit.objects.filter(job=job).count()
+                all_frames = list(FrameLogit.objects.filter(job=job).values_list('frame', flat=True))
                 print(f"   (Job này có tổng cộng {exists} bản ghi logit)")
                 print(f"   (Các frame có logit: {sorted(all_frames)})")
             except Exception as e:
                 print(f"   (Lỗi khi query frames: {e})")
             raise NotFound("Logit map not found in database")
 
-        # 5. Kiểm tra File
+        # 5. Get binary data from database
         try:
-            full_path = meta.get_full_path()
-            print(f"   Full path: {full_path}")
-            print(f"   Path exists: {os.path.exists(full_path)}")
-            if not os.path.exists(full_path):
-                # Kiểm tra thêm xem thư mục có tồn tại không
-                dir_path = os.path.dirname(full_path)
-                print(f"   Directory exists: {os.path.exists(dir_path)}")
-                print(f"   Directory path: {dir_path}")
-                raise NotFound("Logit file missing on disk")
-        except NotFound:
-            raise
+            # FrameLogit.data is a BinaryField containing 16-bit PNG bytes
+            binary_data = frame_logit.data
+            if not binary_data:
+                print(f"❌ Binary data is empty for Job {job.id} Frame {frame_number}")
+                raise NotFound("Logit map data is empty")
+
+            print(f"   Binary data size: {len(binary_data)} bytes")
+            print(f"   Image dimensions: {frame_logit.width}x{frame_logit.height}")
+            print(f"   Compression: {frame_logit.compression}, dtype: {frame_logit.dtype}")
+
         except Exception as e:
-            print(f"🔥 Error checking file path: {e}")
+            print(f"🔥 Error reading binary data: {e}")
             print(traceback.format_exc())
-            raise NotFound(f"Error accessing file: {str(e)}")
+            raise NotFound(f"Error reading logit data: {str(e)}")
 
-        # 6. Trả về ảnh
+        # 6. Trả về ảnh PNG 16-bit
         try:
-            # Fallback mime type đơn giản
-            mime_type = meta.mime_type or "image/png"
+            # FrameLogit stores 16-bit PNG, so content-type is always image/png
+            content_type = "image/png"
 
-            with open(full_path, "rb") as fp:
-                content = fp.read()
-
-            print(f"✅ Returning image: {len(content)} bytes, mime_type: {mime_type}")
-            response = HttpResponse(content, content_type=mime_type)
-            response["Content-Length"] = str(len(content))
+            print(f"✅ Returning image: {len(binary_data)} bytes, content_type: {content_type}")
+            response = HttpResponse(binary_data, content_type=content_type)
+            response["Content-Length"] = str(len(binary_data))
             return response
 
-        except FileNotFoundError:
-            print(f"🔥 File not found: {full_path}")
-            raise NotFound("Logit file not found on disk")
-        except PermissionError as e:
-            print(f"🔥 Permission error: {e}")
-            raise NotFound(f"Permission denied: {str(e)}")
         except Exception as e:
-            print(f"🔥 Error reading file: {e}")
+            print(f"🔥 Error creating response: {e}")
             print(traceback.format_exc())
-            raise NotFound(f"Error reading file: {str(e)}")
+            raise NotFound(f"Error creating response: {str(e)}")
 
 
     @tus_chunk_action(detail=True, suffix_base="annotations")

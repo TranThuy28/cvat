@@ -58,7 +58,7 @@ class Command(BaseCommand):
             src_path = os.path.join(source_dir, filename)
             dest_path = os.path.join(abs_dest_dir, filename)
             try:
-                shutil.copy2(src_path, dest_path)
+            shutil.copy2(src_path, dest_path)
             except Exception as e:
                 self.stdout.write(self.style.ERROR(f"Lỗi copy file {filename}: {e}"))
                 continue
@@ -69,20 +69,20 @@ class Command(BaseCommand):
             mime = 'image/png' if filename.endswith('.png') else 'image/jpeg'
 
             try:
-                obj, created = FrameLogitMeta.objects.update_or_create(
-                    job=job,
-                    frame=frame_number,
-                    defaults={
-                        'relative_path': relative_path_file,
-                        'mime_type': mime
-                    }
-                )
-                status = "Mới" if created else "Update"
+            obj, created = FrameLogitMeta.objects.update_or_create(
+                job=job,
+                frame=frame_number,
+                defaults={
+                    'relative_path': relative_path_file,
+                    'mime_type': mime
+                }
+            )
+            status = "Mới" if created else "Update"
                 frame_mapping[frame_number] = filename
                 # Log đặc biệt cho frame 0
                 if frame_number == 0:
                     self.stdout.write(self.style.SUCCESS(f"✅ Frame 0: {status} ({filename}) -> {relative_path_file}"))
-                count += 1
+            count += 1
             except Exception as e:
                 self.stdout.write(self.style.ERROR(f"Lỗi tạo bản ghi DB cho {filename} (frame {frame_number}): {e}"))
                 continue
